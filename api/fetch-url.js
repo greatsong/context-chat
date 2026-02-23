@@ -84,6 +84,14 @@ export default async function handler(request) {
             if (rows.length) tables.push(rows);
         });
 
+        const allowedOrigins = [
+            'https://context-chat.vercel.app',
+            'http://localhost:5173',
+            'http://localhost:3000',
+        ];
+        const reqOrigin = request.headers.get('origin');
+        const corsOrigin = allowedOrigins.includes(reqOrigin) ? reqOrigin : allowedOrigins[0];
+
         return new Response(JSON.stringify({
             success: true,
             url,
@@ -96,7 +104,7 @@ export default async function handler(request) {
         }), {
             headers: {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Origin': corsOrigin,
             },
         });
 
