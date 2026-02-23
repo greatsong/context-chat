@@ -41,7 +41,11 @@ function App() {
 
   // API & Model
   const DEFAULT_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
-  const [apiKey, setApiKey] = useState(localStorage.getItem('context_chat_api_key') || DEFAULT_API_KEY);
+  const [apiKey, setApiKey] = useState(() => {
+    const stored = localStorage.getItem('context_chat_api_key');
+    if (DEFAULT_API_KEY) return DEFAULT_API_KEY;
+    return stored || '';
+  });
   const [showSettings, setShowSettings] = useState(false);
   const [selectedModel, setSelectedModel] = useState('gemini-3-pro-preview');
 
