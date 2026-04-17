@@ -1,7 +1,87 @@
 import { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+
+// Model Options per Provider
+const MODEL_OPTIONS = {
+  gemini: {
+    label: 'Gemini',
+    models: [
+      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' },
+    ],
+  },
+  claude: {
+    label: 'Claude',
+    models: [
+      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
+    ],
+  },
+  openai: {
+    label: 'OpenAI',
+    models: [
+      { id: 'gpt-4o', name: 'GPT-4o' },
+      { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
+    ],
+  },
+};
+
+// --- API Helpers via Serverless Proxy ---
+async function fetchChat(provider, model, messages, system) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, system, provider, model }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `API Error: ${response.status}`);
+  }
+  const data = await response.json();
+  return data.text;
+}
+
+async function fetchStream(provider, model, messages, system, onChunk) {
+  const response = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, system, provider, model, stream: true }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `API Error: ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (line.startsWith('data: [DONE]')) continue;
+      if (line.startsWith('data: ')) {
+        try {
+          const parsed = JSON.parse(line.slice(6));
+          if (parsed.error) throw new Error(parsed.error);
+          if (parsed.text) {
+            fullText += parsed.text;
+            onChunk(fullText);
+          }
+        } catch (e) {
+          if (e.message && !e.message.includes('Unexpected')) throw e;
+        }
+      }
+    }
+  }
+  return fullText;
+}
 import * as XLSX from 'xlsx';
 import * as pdfjsLib from 'pdfjs-dist';
 import mammoth from 'mammoth';
@@ -17,7 +97,8 @@ function App() {
   // Project State
   const [projects, setProjects] = useState(() => {
     const saved = localStorage.getItem('context_chat_projects');
-    return saved ? JSON.parse(saved) : [];
+    if (!saved) return [];
+    try { return JSON.parse(saved); } catch { return []; }
   });
   const [currentProjectId, setCurrentProjectId] = useState(() => {
     return localStorage.getItem('context_chat_current_project') || null;
@@ -39,15 +120,21 @@ function App() {
   const [isFetchingUrl, setIsFetchingUrl] = useState(false);
   const [isParsingFile, setIsParsingFile] = useState(false);
 
-  // API & Model
-  const DEFAULT_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || '';
-  const [apiKey, setApiKey] = useState(() => {
-    const stored = localStorage.getItem('context_chat_api_key');
-    if (DEFAULT_API_KEY) return DEFAULT_API_KEY;
-    return stored || '';
-  });
+  // API & Model (keys managed server-side)
   const [showSettings, setShowSettings] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gemini-3-pro-preview');
+  const [provider, setProvider] = useState(localStorage.getItem('context_chat_provider') || 'gemini');
+  const [selectedModel, setSelectedModel] = useState(localStorage.getItem('context_chat_model') || 'gemini-2.5-flash');
+  const handleSaveProvider = (p) => {
+    setProvider(p);
+    localStorage.setItem('context_chat_provider', p);
+    const defaultModel = MODEL_OPTIONS[p].models[1]?.id || MODEL_OPTIONS[p].models[0].id;
+    setSelectedModel(defaultModel);
+    localStorage.setItem('context_chat_model', defaultModel);
+  };
+  const handleSaveModel = (m) => {
+    setSelectedModel(m);
+    localStorage.setItem('context_chat_model', m);
+  };
 
   // Chat State
   const [chatInput, setChatInput] = useState('');
@@ -60,11 +147,13 @@ function App() {
   const [selectedPreset, setSelectedPreset] = useState('education');
   const [experts, setExperts] = useState(() => {
     const saved = localStorage.getItem('context_chat_experts');
-    return saved ? JSON.parse(saved) : EXPERT_PRESETS.education;
+    if (!saved) return EXPERT_PRESETS.education;
+    try { return JSON.parse(saved); } catch { return EXPERT_PRESETS.education; }
   });
   const [selectedExperts, setSelectedExperts] = useState(() => {
     const saved = localStorage.getItem('context_chat_selected_experts');
-    return saved ? JSON.parse(saved) : ['curriculum', 'teacher', 'evaluator'];
+    if (!saved) return ['curriculum', 'teacher', 'evaluator'];
+    try { return JSON.parse(saved); } catch { return ['curriculum', 'teacher', 'evaluator']; }
   });
   const [discussionRounds, setDiscussionRounds] = useState(2);
   const [showExpertEditor, setShowExpertEditor] = useState(false);
@@ -72,18 +161,21 @@ function App() {
   // Session Storage
   const [savedSessions, setSavedSessions] = useState(() => {
     const saved = localStorage.getItem('context_chat_sessions');
-    return saved ? JSON.parse(saved) : [];
+    if (!saved) return [];
+    try { return JSON.parse(saved); } catch { return []; }
   });
   const [showSessionManager, setShowSessionManager] = useState(false);
 
   // Expert Rating & Memory
   const [expertRatings, setExpertRatings] = useState(() => {
     const saved = localStorage.getItem('context_chat_expert_ratings');
-    return saved ? JSON.parse(saved) : {};
+    if (!saved) return {};
+    try { return JSON.parse(saved); } catch { return {}; }
   });
   const [expertMemory, setExpertMemory] = useState(() => {
     const saved = localStorage.getItem('context_chat_expert_memory');
-    return saved ? JSON.parse(saved) : {};
+    if (!saved) return {};
+    try { return JSON.parse(saved); } catch { return {}; }
   });
 
   // Get current project
@@ -241,7 +333,7 @@ function App() {
 
   // AI Expert Recommendation with Names
   const handleRecommendExperts = async () => {
-    if (!apiKey || !items.length) return;
+    if (!items.length) return;
     const sampleData = JSON.stringify(items.slice(0, 3), null, 2);
     const prompt = `다음 데이터를 분석하고, 이 주제에 가장 적합한 전문가 3명을 추천해주세요.
 주제가 한국어면 한국 이름, 영어면 영어 이름을 사용하세요.
@@ -253,18 +345,19 @@ function App() {
 
     try {
       setIsGenerating(true);
-      const ai = new GoogleGenAI({ apiKey });
-      const result = await ai.models.generateContent({
-        model: selectedModel,
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-      });
-      const text = result.text || (typeof result.response?.text === 'function' ? result.response.text() : '');
+      const text = await fetchChat(provider, selectedModel,
+        [{ role: 'user', content: prompt }], '');
       const jsonMatch = text.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
-        const recommended = JSON.parse(jsonMatch[0]);
-        setExperts(recommended);
-        setSelectedExperts(recommended.map(e => e.id));
-        setSelectedPreset('custom');
+        try {
+          const recommended = JSON.parse(jsonMatch[0]);
+          setExperts(recommended);
+          setSelectedExperts(recommended.map(e => e.id));
+          setSelectedPreset('custom');
+        } catch (parseErr) {
+          console.error('Failed to parse expert recommendation JSON:', parseErr);
+          alert('전문가 추천 결과 파싱 실패. 다시 시도해주세요.');
+        }
       }
     } catch (error) {
       console.error('Expert recommendation failed:', error);
@@ -276,7 +369,7 @@ function App() {
 
   // Generate Summary
   const handleGenerateSummary = async () => {
-    if (!chatHistory.length || !apiKey) return;
+    if (!chatHistory.length) return;
     const discussionText = chatHistory.map(msg => {
       if (msg.role === 'user') return `[사용자]: ${msg.text}`;
       if (msg.role === 'expert') return `[${msg.expertName}]: ${msg.text}`;
@@ -289,12 +382,8 @@ ${discussionText}`;
 
     try {
       setIsGenerating(true);
-      const ai = new GoogleGenAI({ apiKey });
-      const result = await ai.models.generateContent({
-        model: selectedModel,
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-      });
-      const summary = result.text || (typeof result.response?.text === 'function' ? result.response.text() : '');
+      const summary = await fetchChat(provider, selectedModel,
+        [{ role: 'user', content: prompt }], '');
       setChatHistory(prev => [...prev, { role: 'summary', text: summary }]);
     } catch (error) {
       alert('요약 생성 실패: ' + error.message);
@@ -442,6 +531,23 @@ ${discussionText}`;
   const handleFileUpload = async (e) => {
     const files = Array.from(e.target.files);
     if (!files.length) return;
+
+    // File count limit
+    const MAX_FILE_COUNT = 10;
+    if (files.length > MAX_FILE_COUNT) {
+      alert(`한 번에 최대 ${MAX_FILE_COUNT}개의 파일만 업로드할 수 있습니다.`);
+      e.target.value = '';
+      return;
+    }
+
+    // File size limit (10MB per file)
+    const MAX_FILE_SIZE = 10 * 1024 * 1024;
+    const oversizedFile = files.find(f => f.size > MAX_FILE_SIZE);
+    if (oversizedFile) {
+      alert(`파일 크기는 10MB를 초과할 수 없습니다. ("${oversizedFile.name}" - ${(oversizedFile.size / 1024 / 1024).toFixed(1)}MB)`);
+      e.target.value = '';
+      return;
+    }
 
     setIsParsingFile(true);
     const allNewItems = [];
@@ -644,7 +750,7 @@ ${discussionText}`;
 
   // Multi-Expert Discussion
   const handleStartDiscussion = async () => {
-    if (!chatInput.trim() || !apiKey || isDiscussing) return;
+    if (!chatInput.trim() || isDiscussing) return;
 
     const userQuestion = chatInput;
     setChatHistory(prev => [...prev, { role: 'user', text: userQuestion }]);
@@ -652,7 +758,6 @@ ${discussionText}`;
     setIsDiscussing(true);
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
       const context = buildContext();
       const activeExperts = experts.filter(e => selectedExperts.includes(e.id));
       let conversationHistory = [];
@@ -665,7 +770,7 @@ ${discussionText}`;
             ? `\n[이전 프로젝트에서의 발언 기록]:\n${memory.history.map(h => h.text).join('\n---\n')}\n`
             : '';
 
-          const fullPrompt = `${expert.systemPrompt}${memoryContext}
+          const userContent = `${memoryContext}
 ${context ? `\n${context}\n` : ''}
 [사용자 질문]: ${userQuestion}
 ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
@@ -681,29 +786,20 @@ ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
           };
           setChatHistory(prev => [...prev, expertMsg]);
 
-          const result = await ai.models.generateContentStream({
-            model: selectedModel,
-            contents: [{ role: "user", parts: [{ text: fullPrompt }] }],
-          });
-
-          let fullText = "";
-          for await (const chunk of result) {
-            let chunkText = "";
-            try {
-              if (typeof chunk.text === 'function') chunkText = chunk.text();
-              else if (chunk.text) chunkText = chunk.text;
-            } catch (e) { console.error("Error extracting text:", e); }
-
-            fullText += chunkText;
-            setChatHistory(prev => {
-              const newHistory = [...prev];
-              const lastMsg = newHistory[newHistory.length - 1];
-              if (lastMsg.role === 'expert' && lastMsg.expertId === expert.id) {
-                lastMsg.text = fullText;
-              }
-              return newHistory;
-            });
-          }
+          const fullText = await fetchStream(provider, selectedModel,
+            [{ role: 'user', content: userContent }],
+            expert.systemPrompt,
+            (text) => {
+              setChatHistory(prev => {
+                const newHistory = [...prev];
+                const lastMsg = newHistory[newHistory.length - 1];
+                if (lastMsg.role === 'expert' && lastMsg.expertId === expert.id) {
+                  lastMsg.text = text;
+                }
+                return newHistory;
+              });
+            }
+          );
 
           conversationHistory.push({ expertId: expert.id, expertName: expert.name, text: fullText });
           updateExpertMemory(expert.id, expert.name, fullText);
@@ -712,11 +808,10 @@ ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
           const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
           const foundUrls = fullText.match(urlRegex) || [];
           if (foundUrls.length > 0) {
-            // Store URLs for suggestion
             setChatHistory(prev => [...prev, {
               role: 'suggestion',
               text: `💡 ${expert.name}의 답변에서 ${foundUrls.length}개의 URL을 발견했습니다. 크롤링할까요?`,
-              urls: [...new Set(foundUrls)].slice(0, 5) // Dedupe and limit to 5
+              urls: [...new Set(foundUrls)].slice(0, 5)
             }]);
           }
         }
@@ -770,12 +865,22 @@ ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
               📚 세션 ({savedSessions.length})
             </button>
             <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
+              value={provider}
+              onChange={(e) => handleSaveProvider(e.target.value)}
               className="text-xs bg-white/50 border border-white/50 rounded-lg px-2 py-1.5"
             >
-              <option value="gemini-3-pro-preview">Gemini 3.0 Pro</option>
-              <option value="gemini-3-flash-preview">Gemini 3.0 Flash</option>
+              {Object.entries(MODEL_OPTIONS).map(([key, val]) => (
+                <option key={key} value={key}>{val.label}</option>
+              ))}
+            </select>
+            <select
+              value={selectedModel}
+              onChange={(e) => handleSaveModel(e.target.value)}
+              className="text-xs bg-white/50 border border-white/50 rounded-lg px-2 py-1.5"
+            >
+              {MODEL_OPTIONS[provider].models.map(m => (
+                <option key={m.id} value={m.id}>{m.name}</option>
+              ))}
             </select>
             <button onClick={() => setShowSettings(true)} className="text-slate-500 hover:text-slate-700">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5">
@@ -894,7 +999,7 @@ ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
                 )}
               </div>
 
-              {items.length > 0 && apiKey && (
+              {items.length > 0 && (
                 <button
                   onClick={handleRecommendExperts}
                   disabled={isGenerating}
@@ -1187,12 +1292,12 @@ ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
                     }
                   }}
                   placeholder="전문가들에게 질문하세요..."
-                  disabled={!apiKey || isDiscussing}
+                  disabled={isDiscussing}
                   className="w-full bg-white/80 rounded-xl pl-4 pr-12 py-3 shadow-sm focus:ring-2 focus:ring-purple-400/50"
                 />
                 <button
                   onClick={handleStartDiscussion}
-                  disabled={!apiKey || isDiscussing || !chatInput.trim()}
+                  disabled={isDiscussing || !chatInput.trim()}
                   className="absolute right-2 top-2 p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition disabled:opacity-50"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 transform -rotate-45">
@@ -1209,19 +1314,37 @@ ${prevResponses ? `[이전 토론 내용]:\n${prevResponses}\n\n` : ''}
       {showSettings && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-md flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-3xl shadow-2xl p-6 w-full max-w-md">
-            <h2 className="text-xl font-bold text-slate-800 mb-4">⚙️ API 설정</h2>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Gemini API Key"
-              className="w-full px-4 py-3 border border-slate-200 rounded-xl mb-4"
-            />
-            <button
-              onClick={() => { localStorage.setItem('context_chat_api_key', apiKey); setShowSettings(false); }}
-              className="w-full py-3 bg-purple-600 text-white rounded-xl font-bold hover:bg-purple-700 transition"
-            >
-              저장
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold text-slate-800">⚙️ AI 모델 설정</h2>
+              <button onClick={() => setShowSettings(false)} className="text-slate-400 hover:text-slate-600">✕</button>
+            </div>
+            <p className="text-sm text-slate-500 mb-4">API 키는 서버에서 안전하게 관리됩니다.</p>
+            <div className="mb-4">
+              <label className="block text-xs font-bold text-slate-500 uppercase mb-2">프로바이더</label>
+              <div className="flex gap-2">
+                {Object.entries(MODEL_OPTIONS).map(([key, val]) => (
+                  <button key={key} onClick={() => handleSaveProvider(key)}
+                    className={`flex-1 py-2.5 rounded-xl font-bold text-sm transition-all ${provider === key ? 'bg-purple-600 text-white shadow-lg' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>
+                    {val.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="mb-4">
+              <label className="block text-xs font-bold text-slate-500 uppercase mb-2">모델</label>
+              <div className="space-y-2">
+                {MODEL_OPTIONS[provider].models.map(m => (
+                  <button key={m.id} onClick={() => handleSaveModel(m.id)}
+                    className={`w-full text-left p-3 rounded-xl border transition-all ${selectedModel === m.id ? 'bg-purple-50 border-purple-300 text-purple-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                    <span className="font-bold">{m.name}</span>
+                    <span className="text-xs ml-2 text-slate-400">{m.id}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <button onClick={() => setShowSettings(false)}
+              className="w-full py-3 bg-purple-600 text-white rounded-xl font-bold hover:bg-purple-700 transition">
+              확인
             </button>
           </div>
         </div>
